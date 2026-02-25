@@ -14,6 +14,7 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
+	"go.yaml.in/yaml/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -34,8 +36,10 @@ import (
 )
 
 const (
-	etcdDataDir = "/var/lib/etcd"
-	volumeName  = "etcd-data"
+	etcdDataMountpoint   = "/var/lib/etcd"
+	etcdDataDir          = "/var/lib/etcd/data"
+	volumeName           = "etcd-data"
+	etcdConfigVolumeName = "etcd-config"
 )
 
 type etcdClusterState string
@@ -140,6 +144,92 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	podSpec := corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			// {
+			// 	Name:          "debug",
+			// 	Image:         "busybox",
+			// 	RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+			// 	Command:       []string{"sleep", "9999999"},
+			// 	VolumeMounts: []corev1.VolumeMount{{
+			// 		Name:      volumeName,
+			// 		MountPath: etcdDataMountpoint,
+			// 	}},
+			// },
+			{
+				Name: "etcd-initialize",
+				Args: []string{
+					"initialize",
+					// Snapstore flags
+					"--storage-provider=S3",
+					fmt.Sprintf("--store-prefix=%s", ec.Name),
+					// Client and Backup TLS command line flags
+					"--insecure-transport=true",
+					"--insecure-skip-tls-verify=true",
+					fmt.Sprintf("--endpoints=http://%s:2379", ec.Name),
+					fmt.Sprintf("--service-endpoints=http://%s:2379", ec.Name),
+					// Other flags
+					fmt.Sprintf("--data-dir=%s", etcdDataDir),
+					"--restoration-temp-snapshots-dir=/tmp/var/etcd/data/restoration.tmp",
+					"--snapstore-temp-directory=/tmp/var/etcd/data/temp",
+					"--embedded-etcd-quota-bytes=8589934592",
+					"--etcd-connection-timeout=5m",
+				},
+				//Image: "europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl:latest",
+				Image:           "rg.fr-par.scw.cloud/namespace-nervous-spence/etcdbrctl:dev",
+				ImagePullPolicy: corev1.PullAlways,
+				Ports: []corev1.ContainerPort{
+					{
+						Name:          "server",
+						ContainerPort: 8080,
+						Protocol:      corev1.ProtocolTCP,
+					},
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name: "POD_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.name",
+							},
+						},
+					},
+					{
+						Name: "POD_NAMESPACE",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.namespace",
+							},
+						},
+					},
+					{
+						Name:  "STORAGE_CONTAINER",
+						Value: "devetcdbackups",
+					},
+					{
+						Name:  "AWS_ENDPOINT_URL_S3",
+						Value: "https://s3.fr-par.scw.cloud",
+					},
+					{
+						Name:  "AWS_APPLICATION_CREDENTIALS",
+						Value: "/var/etcd-backup",
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      volumeName,
+						MountPath: etcdDataMountpoint,
+					},
+					{
+						Name:      etcdConfigVolumeName,
+						MountPath: "/var/etcd/config/",
+					},
+					{
+						Name:      "etcd-backup",
+						MountPath: "/var/etcd-backup/",
+					},
+				},
+			},
+		},
 		Containers: []corev1.Container{
 			{
 				Name:    "etcd",
@@ -181,6 +271,148 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 					{
 						Name:          "peer",
 						ContainerPort: 2380,
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      volumeName,
+					MountPath: etcdDataMountpoint,
+				}},
+			},
+			{
+				Name: "backup-restore",
+				Args: []string{
+					"server",
+					// Snapstore flags
+					"--storage-provider=S3",
+					fmt.Sprintf("--store-prefix=%s", ec.Name),
+					// Defragmentation flags
+					"--defragmentation-schedule=0 0 */3 * *",
+					"--etcd-defrag-timeout=8m",
+					// Compaction flags
+					"--auto-compaction-mode=periodic",
+					"--auto-compaction-retention=30m",
+					// Client and Backup TLS command line flags
+					"--insecure-transport=true",
+					"--insecure-skip-tls-verify=true",
+					"--endpoints=http://localhost:2379",
+					fmt.Sprintf("--service-endpoints=http://%s:2379", ec.Name),
+					// Other flags
+					fmt.Sprintf("--data-dir=%s", etcdDataDir),
+					"--restoration-temp-snapshots-dir=/tmp/var/etcd/data/restoration.tmp",
+					"--snapstore-temp-directory=/tmp/var/etcd/data/temp",
+					"--embedded-etcd-quota-bytes=8589934592",
+					"--etcd-connection-timeout=5m",
+					"--etcd-connection-timeout-leader-election=5s",
+					"--reelection-period=5s",
+					"--delta-snapshot-period=1m",
+				},
+				//Image: "europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl:latest",
+				Image:           "rg.fr-par.scw.cloud/namespace-nervous-spence/etcdbrctl:dev",
+				ImagePullPolicy: corev1.PullAlways,
+				Ports: []corev1.ContainerPort{
+					{
+						Name:          "server",
+						ContainerPort: 8080,
+						Protocol:      corev1.ProtocolTCP,
+					},
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name: "POD_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.name",
+							},
+						},
+					},
+					{
+						Name: "POD_NAMESPACE",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.namespace",
+							},
+						},
+					},
+					{
+						Name:  "STORAGE_CONTAINER",
+						Value: "devetcdbackups",
+					},
+					{
+						Name:  "AWS_ENDPOINT_URL_S3",
+						Value: "https://s3.fr-par.scw.cloud",
+					},
+					{
+						Name:  "AWS_APPLICATION_CREDENTIALS",
+						Value: "/var/etcd-backup",
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      volumeName,
+						MountPath: etcdDataMountpoint,
+					},
+					{
+						Name:      etcdConfigVolumeName,
+						MountPath: "/var/etcd/config/",
+					},
+					{
+						Name:      "etcd-backup",
+						MountPath: "/var/etcd-backup/",
+					},
+				},
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: etcdConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: configMapNameForEtcdCluster(ec),
+						},
+						DefaultMode: ptr.To(int32(0644)),
+						Items: []corev1.KeyToPath{
+							{
+								Key:  "etcd.conf.yaml",
+								Path: "etcd.conf.yaml",
+							},
+						},
+					},
+				},
+			},
+			{
+				Name: "etcd-backup",
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						DefaultMode: ptr.To(int32(0444)),
+						Sources: []corev1.VolumeProjection{
+							{
+								Secret: &corev1.SecretProjection{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "etcdbrctl-s3-credentials", // NOTE: secret name is hardcoded for now.
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		SecurityContext: &corev1.PodSecurityContext{
+			RunAsGroup:   ptr.To(int64(65532)),
+			RunAsUser:    ptr.To(int64(65532)),
+			RunAsNonRoot: ptr.To(true),
+			FSGroup:      ptr.To(int64(65532)),
+		},
+		ShareProcessNamespace: ptr.To(true),
+		Affinity: &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: labels,
+						},
+						TopologyKey: "kubernetes.io/hostname",
 					},
 				},
 			},
@@ -245,12 +477,6 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	if ec.Spec.StorageSpec != nil {
-
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
@@ -300,6 +526,13 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		default:
 			return fmt.Errorf("AccessMode %s is not supported", ec.Spec.StorageSpec.AccessModes)
 		}
+	} else {
+		stsSpec.Template.Spec.Volumes = append(stsSpec.Template.Spec.Volumes, corev1.Volume{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
 	}
 
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
@@ -420,6 +653,12 @@ func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string,
 		ec.Name, index, ec.Name, ec.Namespace)
 }
 
+func clientEndpointForOrdinalIndexCluster(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
+	name := fmt.Sprintf("%s-%d", ec.Name, index)
+	return name, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
+		ec.Name, index, ec.Name, ec.Namespace)
+}
+
 func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
 	// We always add members one by one, so the state is always
 	// "existing" if replica > 1.
@@ -429,10 +668,32 @@ func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.Config
 		state = etcdClusterStateExisting
 	}
 
+	serverConfig := EtcdServerConfig{
+		DataDir:                  etcdDataDir,
+		ListenClientURLs:         "http://0.0.0.0:2379",
+		ListenPeerURLs:           "http://0.0.0.0:2380",
+		InitialClusterState:      string(state),
+		QuotaBackendBytes:        8589934592,
+		InitialAdvertisePeerURLs: make(map[string][]string),
+		AdvertiseClientURLs:      make(map[string][]string),
+	}
+
 	var initialCluster []string
 	for i := 0; i < replica; i++ {
 		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
+		_, clientURL := clientEndpointForOrdinalIndexCluster(ec, i)
+
 		initialCluster = append(initialCluster, fmt.Sprintf("%s=%s", name, peerURL))
+
+		serverConfig.InitialAdvertisePeerURLs[name] = append(serverConfig.InitialAdvertisePeerURLs[name], peerURL)
+		serverConfig.AdvertiseClientURLs[name] = append(serverConfig.AdvertiseClientURLs[name], clientURL)
+	}
+
+	serverConfig.InitialCluster = strings.Join(initialCluster, ",")
+
+	rawServerConfig, err := yaml.Marshal(serverConfig)
+	if err != nil {
+		panic(err)
 	}
 
 	return &corev1.ConfigMap{
@@ -444,6 +705,7 @@ func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.Config
 			"ETCD_INITIAL_CLUSTER_STATE": string(state),
 			"ETCD_INITIAL_CLUSTER":       strings.Join(initialCluster, ","),
 			"ETCD_DATA_DIR":              etcdDataDir,
+			"etcd.conf.yaml":             string(rawServerConfig), // TODO: create this file in an initContainer, using the above env vars.
 		},
 	}
 }
@@ -827,4 +1089,22 @@ func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target stri
 	}
 
 	return true, nil
+}
+
+type EtcdServerConfig struct {
+	Name                     string              `yaml:"name,omitempty"`
+	DataDir                  string              `yaml:"data-dir,omitempty"`
+	Metrics                  string              `yaml:"metrics,omitempty"`
+	SnapshotCount            int64               `yaml:"snapshot-count,omitempty"`
+	EnableV2                 bool                `yaml:"enable-v2,omitempty"`
+	QuotaBackendBytes        int64               `yaml:"quota-backend-bytes,omitempty"`
+	ListenClientURLs         string              `yaml:"listen-client-urls,omitempty"`
+	ListenPeerURLs           string              `yaml:"listen-peer-urls,omitempty"`
+	AdvertiseClientURLs      map[string][]string `yaml:"advertise-client-urls,omitempty"`
+	InitialAdvertisePeerURLs map[string][]string `yaml:"initial-advertise-peer-urls,omitempty"`
+	InitialCluster           string              `yaml:"initial-cluster,omitempty"`
+	InitialClusterToken      string              `yaml:"initial-cluster-token,omitempty"`
+	InitialClusterState      string              `yaml:"initial-cluster-state,omitempty"`
+	AutoCompactionMode       string              `yaml:"auto-compaction-mode,omitempty"`
+	AutoCompactionRetention  string              `yaml:"auto-compaction-retention,omitempty"`
 }
