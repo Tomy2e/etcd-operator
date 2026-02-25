@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -34,8 +35,99 @@ import (
 )
 
 const (
-	etcdDataDir = "/var/lib/etcd"
-	volumeName  = "etcd-data"
+	etcdDataMountpoint   = "/var/lib/etcd"
+	etcdDataDir          = "/var/lib/etcd/data"
+	volumeName           = "etcd-data"
+	etcdConfigVolumeName = "etcd-config"
+	initializationScript = `#!/bin/sh
+
+BACKUP_ENDPOINT="http://localhost:8080"
+
+while true;
+do
+    STATUS=$(wget "$BACKUP_ENDPOINT/initialization/status" -q -O -);
+    case $STATUS in
+    "New")
+            wget "$BACKUP_ENDPOINT/initialization/start" -S -O - ;;
+    "Progress")
+            sleep 1;
+            continue;;
+    "Failed")
+            sleep 1;
+            continue;;
+    "Successful")
+            echo "Bootstrap preprocessing end time: $(date)"
+            break
+            ;;
+    *)
+            sleep 1;
+            ;;
+    esac;
+done`
+
+	generateEtcdConfigScript = `#!/bin/sh
+
+# Exit on error
+set -e
+
+# Validate required environment variables
+if [ -z "$ETCD_DATA_DIR" ]; then
+  echo "ETCD_DATA_DIR is not set"
+  exit 1
+fi
+
+if [ -z "$ETCD_INITIAL_CLUSTER" ]; then
+  echo "ETCD_INITIAL_CLUSTER is not set"
+  exit 1
+fi
+
+if [ -z "$ETCD_INITIAL_CLUSTER_STATE" ]; then
+  echo "ETCD_INITIAL_CLUSTER_STATE is not set"
+  exit 1
+fi
+
+OUTPUT_FILE="${1:-/var/etcd/config/etcd.conf.yaml}"
+
+# Start YAML
+echo "advertise-client-urls:" > "$OUTPUT_FILE"
+
+# Split on commas
+OLD_IFS="$IFS"
+IFS=','
+
+for MEMBER in $ETCD_INITIAL_CLUSTER; do
+  NAME=$(echo "$MEMBER" | cut -d '=' -f 1)
+  PEER_URL=$(echo "$MEMBER" | cut -d '=' -f 2-)
+
+  # Replace peer port (2380) with client port (2379)
+  CLIENT_URL=$(echo "$PEER_URL" | sed 's/:2380$/:2379/')
+
+  echo "    $NAME:" >> "$OUTPUT_FILE"
+  echo "        - $CLIENT_URL" >> "$OUTPUT_FILE"
+done
+
+# initial-advertise-peer-urls
+echo "initial-advertise-peer-urls:" >> "$OUTPUT_FILE"
+
+for MEMBER in $ETCD_INITIAL_CLUSTER; do
+  NAME=$(echo "$MEMBER" | cut -d '=' -f 1)
+  PEER_URL=$(echo "$MEMBER" | cut -d '=' -f 2-)
+
+  echo "    $NAME:" >> "$OUTPUT_FILE"
+  echo "        - $PEER_URL" >> "$OUTPUT_FILE"
+done
+
+# Restore IFS
+IFS="$OLD_IFS"
+
+# Remaining fields
+echo "initial-cluster: $ETCD_INITIAL_CLUSTER" >> "$OUTPUT_FILE"
+echo "initial-cluster-state: $ETCD_INITIAL_CLUSTER_STATE" >> "$OUTPUT_FILE"
+echo "quota-backend-bytes: 8589934592" >> "$OUTPUT_FILE"
+echo "listen-client-urls: http://0.0.0.0:2379" >> "$OUTPUT_FILE"
+echo "listen-peer-urls: http://0.0.0.0:2380" >> "$OUTPUT_FILE"
+
+echo "YAML configuration written to $OUTPUT_FILE"`
 )
 
 type etcdClusterState string
@@ -140,6 +232,119 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	podSpec := corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{
+				Name:    "generate-etcd-config",
+				Image:   "busybox",
+				Command: []string{"/bin/sh", "-c", generateEtcdConfigScript},
+				EnvFrom: []corev1.EnvFromSource{
+					{
+						ConfigMapRef: &corev1.ConfigMapEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: configMapNameForEtcdCluster(ec),
+							},
+						},
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      etcdConfigVolumeName,
+						MountPath: "/var/etcd/config/",
+					},
+				},
+			},
+			{
+				Name:          "etcd-backup-restore-server",
+				RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+				Args: []string{
+					"server",
+					// Snapstore flags
+					"--storage-provider=S3",
+					fmt.Sprintf("--store-prefix=%s", ec.Name),
+					// Defragmentation flags
+					"--defragmentation-schedule=0 0 */3 * *",
+					"--etcd-defrag-timeout=8m",
+					// Compaction flags
+					"--auto-compaction-mode=periodic",
+					"--auto-compaction-retention=30m",
+					// Client and Backup TLS command line flags
+					"--insecure-transport=true",
+					"--insecure-skip-tls-verify=true",
+					"--endpoints=http://localhost:2379",
+					fmt.Sprintf("--service-endpoints=http://%s:2379", ec.Name),
+					// Other flags
+					fmt.Sprintf("--data-dir=%s", etcdDataDir),
+					"--restoration-temp-snapshots-dir=/tmp/var/etcd/data/restoration.tmp",
+					"--snapstore-temp-directory=/tmp/var/etcd/data/temp",
+					"--embedded-etcd-quota-bytes=8589934592",
+					"--etcd-connection-timeout=5m",
+					"--etcd-connection-timeout-leader-election=5s",
+					"--reelection-period=5s",
+					"--delta-snapshot-period=1m",
+				},
+				Image:           "europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl:latest",
+				ImagePullPolicy: corev1.PullAlways,
+				Ports: []corev1.ContainerPort{
+					{
+						Name:          "server",
+						ContainerPort: 8080,
+						Protocol:      corev1.ProtocolTCP,
+					},
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name: "POD_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.name",
+							},
+						},
+					},
+					{
+						Name: "POD_NAMESPACE",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.namespace",
+							},
+						},
+					},
+					{
+						Name:  "STORAGE_CONTAINER",
+						Value: "devetcdbackups",
+					},
+					{
+						Name:  "AWS_ENDPOINT_URL_S3",
+						Value: "https://s3.fr-par.scw.cloud",
+					},
+					{
+						Name:  "AWS_APPLICATION_CREDENTIALS",
+						Value: "/var/etcd-backup",
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      volumeName,
+						MountPath: etcdDataMountpoint,
+					},
+					{
+						Name:      etcdConfigVolumeName,
+						MountPath: "/var/etcd/config/",
+					},
+					{
+						Name:      "etcd-backup",
+						MountPath: "/var/etcd-backup/",
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					RunAsUser: ptr.To(int64(0)),
+				},
+			},
+			{
+				Name:    "initialize",
+				Image:   "busybox",
+				Command: []string{"/bin/sh", "-c", initializationScript},
+			},
+		},
 		Containers: []corev1.Container{
 			{
 				Name:    "etcd",
@@ -181,6 +386,47 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 					{
 						Name:          "peer",
 						ContainerPort: 2380,
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      volumeName,
+					MountPath: etcdDataMountpoint,
+				}},
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: etcdConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+			{
+				Name: "etcd-backup",
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						DefaultMode: ptr.To(int32(0444)),
+						Sources: []corev1.VolumeProjection{
+							{
+								Secret: &corev1.SecretProjection{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "etcdbrctl-s3-credentials", // NOTE: secret name is hardcoded for now.
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Affinity: &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: labels,
+						},
+						TopologyKey: "kubernetes.io/hostname",
 					},
 				},
 			},
@@ -245,12 +491,6 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	if ec.Spec.StorageSpec != nil {
-
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
@@ -300,6 +540,13 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		default:
 			return fmt.Errorf("AccessMode %s is not supported", ec.Spec.StorageSpec.AccessModes)
 		}
+	} else {
+		stsSpec.Template.Spec.Volumes = append(stsSpec.Template.Spec.Volumes, corev1.Volume{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
 	}
 
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
