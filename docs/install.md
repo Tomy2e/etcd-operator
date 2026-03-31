@@ -13,7 +13,7 @@ Welcome to version 0.1.0 of the etcd-operator!  At this point it doesn't do a lo
 To install the default generated operator, run the following command:
 
 ```bash
-curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl apply -f -
+curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl apply --server-side -f -
 ```
 
 If this isn't a good approach for your environment, download the `install-v0.1.0.yaml` installation file from GitHub, and use your chosen Kubernetes management tool to apply it.

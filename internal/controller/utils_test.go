@@ -697,6 +697,171 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 	}
 }
 
+func TestCreateOrPatchStatefulSetWithPodTemplateSpec(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	falseVal := false
+	nonRoot := true
+	uid := int64(1000)
+
+	tests := []struct {
+		name        string
+		podTemplate *ecv1alpha1.PodTemplate
+		verify      func(t *testing.T, sts *appsv1.StatefulSet)
+	}{
+		{
+			name: "security context is applied to etcd container via strategic merge patch",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Spec: &corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &nonRoot,
+						RunAsUser:    &uid,
+					},
+					Containers: []corev1.Container{
+						{
+							Name: "etcd",
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: &falseVal,
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, sts *appsv1.StatefulSet) {
+				podSpec := sts.Spec.Template.Spec
+				require.NotNil(t, podSpec.SecurityContext)
+				assert.Equal(t, &nonRoot, podSpec.SecurityContext.RunAsNonRoot)
+				assert.Equal(t, &uid, podSpec.SecurityContext.RunAsUser)
+
+				require.Len(t, podSpec.Containers, 1)
+				etcd := podSpec.Containers[0]
+				assert.Equal(t, "etcd", etcd.Name)
+				require.NotNil(t, etcd.SecurityContext)
+				assert.Equal(t, &falseVal, etcd.SecurityContext.AllowPrivilegeEscalation)
+				require.NotNil(t, etcd.SecurityContext.Capabilities)
+				assert.Equal(t, []corev1.Capability{"ALL"}, etcd.SecurityContext.Capabilities.Drop)
+
+				// Operator-set fields on the etcd container must be preserved
+				assert.NotEmpty(t, etcd.Image)
+				assert.NotEmpty(t, etcd.Command)
+				assert.NotEmpty(t, etcd.Args)
+			},
+		},
+		{
+			name: "scheduling fields (affinity, nodeSelector, tolerations) still work via spec",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Spec: &corev1.PodSpec{
+					NodeSelector: map[string]string{"node-type": "storage"},
+					Tolerations: []corev1.Toleration{
+						{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "etcd"},
+					},
+				},
+			},
+			verify: func(t *testing.T, sts *appsv1.StatefulSet) {
+				podSpec := sts.Spec.Template.Spec
+				assert.Equal(t, map[string]string{"node-type": "storage"}, podSpec.NodeSelector)
+				require.Len(t, podSpec.Tolerations, 1)
+				assert.Equal(t, "dedicated", podSpec.Tolerations[0].Key)
+			},
+		},
+		{
+			name: "additional sidecar container is injected alongside etcd container",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Spec: &corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "metrics-exporter", Image: "prom/prometheus:latest"},
+					},
+				},
+			},
+			verify: func(t *testing.T, sts *appsv1.StatefulSet) {
+				containers := sts.Spec.Template.Spec.Containers
+				require.Len(t, containers, 2)
+				names := []string{containers[0].Name, containers[1].Name}
+				assert.Contains(t, names, "etcd")
+				assert.Contains(t, names, "metrics-exporter")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-etcd",
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:          3,
+					Version:       "3.5.17",
+					ImageRegistry: "gcr.io/etcd-development/etcd",
+					PodTemplate:   tt.podTemplate,
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			require.NoError(t, err)
+
+			sts := &appsv1.StatefulSet{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
+			require.NoError(t, err)
+
+			tt.verify(t, sts)
+		})
+	}
+}
+
+func TestMergePodSpec(t *testing.T) {
+	falseVal := false
+	nonRoot := true
+
+	base := corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:    "etcd",
+				Image:   "gcr.io/etcd-development/etcd:v3.5.17",
+				Command: []string{"/usr/local/bin/etcd"},
+			},
+		},
+	}
+
+	override := corev1.PodSpec{
+		SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: &nonRoot},
+		Containers: []corev1.Container{
+			{
+				Name: "etcd",
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseVal,
+				},
+			},
+		},
+	}
+
+	merged, err := mergePodSpec(base, override)
+	require.NoError(t, err)
+
+	// Base container fields must be preserved
+	require.Len(t, merged.Containers, 1)
+	assert.Equal(t, "etcd", merged.Containers[0].Name)
+	assert.Equal(t, "gcr.io/etcd-development/etcd:v3.5.17", merged.Containers[0].Image)
+	assert.Equal(t, []string{"/usr/local/bin/etcd"}, merged.Containers[0].Command)
+
+	// Override fields must be applied
+	require.NotNil(t, merged.SecurityContext)
+	assert.Equal(t, &nonRoot, merged.SecurityContext.RunAsNonRoot)
+	require.NotNil(t, merged.Containers[0].SecurityContext)
+	assert.Equal(t, &falseVal, merged.Containers[0].SecurityContext.AllowPrivilegeEscalation)
+}
+
 func TestCreatingArgs(t *testing.T) {
 	tests := []struct {
 		testName       string

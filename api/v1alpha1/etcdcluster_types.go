@@ -53,14 +53,12 @@ type EtcdClusterSpec struct {
 
 type PodTemplate struct {
 	// Metadata is the metadata to add to the pod.
-	Metadata *PodMetadata `json:"metadata,omitempty"`
-	Spec     *PodSpec     `json:"spec,omitempty"`
-}
-
-type PodSpec struct {
-	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
-	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
-	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+	Metadata *PodMetadata    `json:"metadata,omitempty"`
+	// Spec is the pod spec to merge with the operator-generated pod spec using
+	// strategic merge patch semantics. Containers are matched by name, allowing
+	// you to set security contexts, resource limits, volume mounts, and other
+	// container-level fields on the "etcd" container without replacing it.
+	Spec     *corev1.PodSpec `json:"spec,omitempty"`
 }
 
 type PodMetadata struct {

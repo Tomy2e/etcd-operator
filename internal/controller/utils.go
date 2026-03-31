@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -217,13 +219,6 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		Annotations: make(map[string]string),
 	}
 
-	// Pod Scheduling specs
-	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Spec != nil {
-		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
-		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
-		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
-	}
-
 	// Apply custom metadata from PodTemplate if provided
 	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
 		// Apply custom labels
@@ -308,6 +303,18 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		default:
 			return fmt.Errorf("AccessMode %s is not supported", ec.Spec.StorageSpec.AccessModes)
 		}
+	}
+
+	// Apply user's PodTemplate.Spec as a strategic merge patch on top of the
+	// operator-generated spec. Containers are matched by name so fields like
+	// securityContext and resources on the "etcd" container are merged rather
+	// than replaced wholesale.
+	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Spec != nil {
+		merged, err := mergePodSpec(stsSpec.Template.Spec, *ec.Spec.PodTemplate.Spec)
+		if err != nil {
+			return fmt.Errorf("merging pod spec from podTemplate: %w", err)
+		}
+		stsSpec.Template.Spec = merged
 	}
 
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
@@ -785,6 +792,29 @@ func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c c
 	}
 
 	return nil
+}
+
+// mergePodSpec applies override onto base using strategic merge patch semantics.
+// Lists with a patchMergeKey (e.g. containers by name, volumeMounts by mountPath)
+// are merged element-by-element rather than replaced wholesale.
+func mergePodSpec(base, override corev1.PodSpec) (corev1.PodSpec, error) {
+	baseJSON, err := json.Marshal(base)
+	if err != nil {
+		return corev1.PodSpec{}, fmt.Errorf("marshalling base pod spec: %w", err)
+	}
+	overrideJSON, err := json.Marshal(override)
+	if err != nil {
+		return corev1.PodSpec{}, fmt.Errorf("marshalling override pod spec: %w", err)
+	}
+	mergedJSON, err := strategicpatch.StrategicMergePatch(baseJSON, overrideJSON, corev1.PodSpec{})
+	if err != nil {
+		return corev1.PodSpec{}, fmt.Errorf("applying strategic merge patch to pod spec: %w", err)
+	}
+	var merged corev1.PodSpec
+	if err := json.Unmarshal(mergedJSON, &merged); err != nil {
+		return corev1.PodSpec{}, fmt.Errorf("unmarshalling merged pod spec: %w", err)
+	}
+	return merged, nil
 }
 
 // validateEtcdUpgradePat can be used to check if the current and target versions align
